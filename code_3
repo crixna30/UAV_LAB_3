@@ -1,0 +1,557 @@
+% Crazyflie Control Simulation
+% This script simulates linear and nonlinear controllers for a Crazyflie drone.
+% Part 1 covers LQR control design based on a linearized model.
+% Part 2 implements and tests a nonlinear PD controller with feedforward.
+
+clear; clc; close all;
+
+%% --- Simulation Parameters ---
+% Drone Physical Parameters
+m = 0.030;  % Mass (kg) - Crazyflie 2.1 approximate
+g = 9.81;   % Gravitational acceleration (m/s^2)
+
+% Actuator Saturation Limits
+T_min = 0.0;            % Minimum total thrust (N)
+T_max = 2.0 * m * g;    % Maximum total thrust (N), e.g., 2g capability
+phi_max_abs = deg2rad(30); % Maximum absolute roll angle (radians)
+theta_max_abs = deg2rad(30);% Maximum absolute pitch angle (radians)
+
+% LQR Controller Parameters
+% Q: State error penalty matrix [px, py, pz, vx, vy, vz]'
+Q_lqr = diag([10, 10, 10, 1, 1, 1]);
+% R: Control input penalty matrix ua = [uax, uay, uaz]'
+R_lqr = diag([0.1, 0.1, 0.1]);
+
+% Simulation Time Setup
+t_start = 0;    % Start time (s)
+t_end = 10;     % End time (s)
+dt = 0.01;      % Time step for ODE solver output (s)
+t_eval = t_start:dt:t_end; % Evaluation time points for ODE and plotting
+
+fprintf('Crazyflie Control Simulation Initialized.\n');
+fprintf('----------------------------------------\n');
+
+%% TASK 1: LINEAR CONTROL
+fprintf('\nPART 1: Linear Control Design and Simulation\n');
+
+% --- 1.1: Simplified Nonlinear Model ---
+% The core dynamics are implemented in `nonlinear_plant_dynamics`.
+% This function takes current state [p;v] and attitude commands [T,phi,theta,psi]
+% and returns the state derivatives [v; p_ddot].
+% For this project, yaw (psi) is assumed to be controlled to zero.
+fprintf('\n--- 1.1: Simplified Nonlinear Model Reference ---\n');
+fprintf('   - `nonlinear_plant_dynamics` function models the drone.\n');
+fprintf('   - Inputs: Total Thrust (T), Roll (phi), Pitch (theta), Yaw (psi=0).\n');
+fprintf('   - State: [px, py, pz, vx, vy, vz]''.\n');
+
+% --- 1.2: Equivalent Acceleration Input (ua) ---
+% Under small roll/pitch angle and zero yaw assumptions, the relationship between
+% desired inertial acceleration (ua) and physical inputs (T, phi, theta) is:
+%   uax = (T/m) * theta
+%   uay = -(T/m) * phi
+%   uaz = (T/m) - g
+% The inverse, converting ua_desired to T_actual, phi_actual, theta_actual
+% (including saturations) is implemented in `ua_to_actual_controls`.
+fprintf('\n--- 1.2: Equivalent Acceleration Input `ua` ---\n');
+fprintf('   - `ua_to_actual_controls` converts desired `ua` to `T, phi, theta`.\n');
+
+% --- 1.3: Linear Model for Drone Motion ---
+% State: x = [p; v] = [px, py, pz, vx, vy, vz]'
+% Control: ua = [uax, uay, uaz]' (desired inertial accelerations)
+% Dynamics: x_dot = A_lin * x + B_lin * ua
+%   p_dot = v
+%   v_dot = ua
+fprintf('\n--- 1.3: Linear State-Space Model Definition ---\n');
+A_lin = [zeros(3,3), eye(3);
+         zeros(3,3), zeros(3,3)];
+B_lin = [zeros(3,3);
+         eye(3)];
+fprintf('   A_lin matrix defined.\n');
+fprintf('   B_lin matrix defined.\n');
+
+% --- 1.4: LQR Controller for Regulation ---
+% Goal: Drive the state x to the origin (x_ref = 0).
+% Cost: J = integral (x''Q_lqr*x + ua''R_lqr*ua) dt
+fprintf('\n--- 1.4: LQR Controller for Regulation ---\n');
+[K_reg, ~, ~] = lqr(A_lin, B_lin, Q_lqr, R_lqr);
+fprintf('   LQR Regulation Gain K_reg computed.\n');
+
+x0_reg = [1; -1; 0.5; 0; 0; 0]; % Initial state for regulation test
+
+% Test LQR Regulator on Linear Model
+A_cl_linear_reg = A_lin - B_lin * K_reg;
+sys_cl_linear_reg = ss(A_cl_linear_reg, [], eye(6), []);
+[~, ~, x_lin_reg_raw] = initial(sys_cl_linear_reg, x0_reg, t_eval);
+x_lin_reg = x_lin_reg_raw';
+fprintf('   Regulation simulated on the linear model.\n');
+
+% Test LQR Regulator on Nonlinear Model
+x_ref_regulation = zeros(6,1); % Target state is origin
+ua_ff_regulation = zeros(3,1); % No feedforward for regulation to origin
+
+ode_options = odeset('RelTol',1e-6, 'AbsTol',1e-9);
+[t_nl_reg, x_nl_reg_raw] = ode45(@(t,x) nonlinear_dynamics_with_lqr(t, x, m, g, K_reg, ...
+                                T_min, T_max, phi_max_abs, theta_max_abs, ...
+                                x_ref_regulation, ua_ff_regulation), ...
+                                t_eval, x0_reg, ode_options);
+x_nl_reg = x_nl_reg_raw';
+
+% Extract control inputs for nonlinear regulation simulation
+[ua_nl_reg_cmds, T_nl_reg, phi_nl_reg, theta_nl_reg] = ...
+    extract_controls_from_lqr_sim(t_nl_reg, x_nl_reg, K_reg, x_ref_regulation, ua_ff_regulation, m, g, T_min, T_max, phi_max_abs, theta_max_abs);
+fprintf('   Regulation simulated on the nonlinear model.\n');
+
+plot_regulation_results(t_eval, x_lin_reg, t_nl_reg, x_nl_reg, x_ref_regulation, ...
+                        ua_nl_reg_cmds, T_nl_reg, phi_nl_reg, theta_nl_reg, m*g);
+fprintf('   Plotting for LQR Regulation completed.\n');
+
+
+% --- 1.5: Error State Vector Model ---
+% For tracking a reference x_bar(t), define error err_x = x - x_bar.
+% If x_bar_dot = A_lin*x_bar + B_lin*ua_bar, then
+%   err_x_dot = A_lin*err_x + B_lin*err_ua, where err_ua = ua - ua_bar.
+% The (A_lin, B_lin) matrices for error dynamics are identical.
+fprintf('\n--- 1.5: Error State Model Formulation ---\n');
+fprintf('   - err_x_dot = A_lin*err_x + B_lin*err_ua.\n');
+fprintf('   - Control input to plant: ua = err_ua + ua_bar.\n');
+
+% --- 1.6: LQR Controller for Tracking via Error Dynamics ---
+% Goal: Drive error err_x to zero.
+fprintf('\n--- 1.6: LQR Controller for Tracking (Setpoint) ---\n');
+K_track = K_reg; % Gain is the same as K_reg due to identical dynamics
+fprintf('   LQR Tracking Gain K_track is K_reg.\n');
+
+% Define a static setpoint to track
+x_ref_setpoint = [0.5; 0.8; 1.0; 0; 0; 0]; % Target p=(0.5,0.8,1.0), v=(0,0,0)
+% For a static setpoint with zero desired velocity and acceleration,
+% the feedforward acceleration ua_bar is zero.
+ua_ff_setpoint = [0; 0; 0];
+x0_track = [0; 0; 0.2; 0; 0; 0]; % Initial state for tracking test
+fprintf('   Tracking static setpoint: p_ref = [%.1f; %.1f; %.1f] m.\n', x_ref_setpoint(1:3));
+
+% Test LQR Tracker on Nonlinear Model
+[t_nl_track, x_nl_track_raw] = ode45(@(t,x) nonlinear_dynamics_with_lqr(t, x, m, g, K_track, ...
+                                T_min, T_max, phi_max_abs, theta_max_abs, ...
+                                x_ref_setpoint, ua_ff_setpoint), ...
+                                t_eval, x0_track, ode_options);
+x_nl_track = x_nl_track_raw';
+
+% Extract control inputs for nonlinear tracking simulation
+[ua_nl_track_cmds, T_nl_track, phi_nl_track, theta_nl_track] = ...
+    extract_controls_from_lqr_sim(t_nl_track, x_nl_track, K_track, x_ref_setpoint, ua_ff_setpoint, m, g, T_min, T_max, phi_max_abs, theta_max_abs);
+fprintf('   Setpoint tracking simulated on the nonlinear model.\n');
+
+plot_tracking_results(t_nl_track, x_nl_track, x_ref_setpoint, ...
+                      ua_nl_track_cmds, T_nl_track, phi_nl_track, theta_nl_track, m*g);
+fprintf('   Plotting for LQR Tracking completed.\n');
+
+fprintf('\nEnd of PART 1.\n');
+fprintf('----------------------------------------\n');
+
+%% TASK 2: NONLINEAR CONTROL AND TRIALS (SIMULATION ONLY)
+fprintf('\nPART 2: Nonlinear Control Design and Simulation\n');
+
+% --- 2.1: Nonlinear Control Design ---
+% Controller: ua_cmd = ad - Kp_nl*(p - pd) - Kd_nl*(v - vd)
+% Where: (p,v) are current, (pd,vd,ad) are desired position, velocity, acceleration.
+% Kp_nl, Kd_nl are positive definite gain matrices.
+% Asymptotic stability proven via Lyapunov theory.
+fprintf('\n--- 2.1: Nonlinear Controller Design (PD + Feedforward) ---\n');
+% Nonlinear Controller Gains
+kpx_nl = 7.0; kpy_nl = 7.0; kpz_nl = 10.0; % Position error gains
+kdx_nl = 4.5; kdy_nl = 4.5; kdz_nl = 6.0;  % Velocity error gains (damping)
+
+Kp_nl = diag([kpx_nl, kpy_nl, kpz_nl]);
+Kd_nl = diag([kdx_nl, kdy_nl, kdz_nl]);
+fprintf('   Nonlinear controller gains Kp_nl and Kd_nl defined.\n');
+
+% --- 2.2: Test Nonlinear Controller in Simulation ---
+fprintf('\n--- 2.2: Testing Nonlinear Controller in Simulation ---\n');
+
+% Case 1: Tracking a Static Setpoint
+fprintf('   Case 1: Tracking a Static Setpoint with Nonlinear Controller.\n');
+x0_nlc_static = [0; 0; 0.2; 0; 0; 0]; % Initial state
+pd_static_ref = [0.5; 0.8; 1.0];      % Desired position
+vd_static_ref = [0; 0; 0];            % Desired velocity
+ad_static_ref = [0; 0; 0];            % Desired acceleration (feedforward)
+fprintf('      Tracking static setpoint: p_ref = [%.1f; %.1f; %.1f] m.\n', pd_static_ref);
+
+[t_nlc_static, x_nlc_static_raw] = ode45(@(t,x_state) nonlinear_dynamics_with_nonlinear_controller(t, x_state, m, g, ...
+                                Kp_nl, Kd_nl, ...
+                                @(time) pd_static_ref, ...
+                                @(time) vd_static_ref, ...
+                                @(time) ad_static_ref, ...
+                                T_min, T_max, phi_max_abs, theta_max_abs), ...
+                                t_eval, x0_nlc_static, ode_options);
+x_nlc_static = x_nlc_static_raw';
+
+% Extract controls for nonlinear static setpoint tracking
+[ua_nlc_static_cmds, T_nlc_static, phi_nlc_static, theta_nlc_static] = ...
+    extract_controls_from_nlc_sim(t_nlc_static, x_nlc_static, Kp_nl, Kd_nl, @(time) pd_static_ref, @(time) vd_static_ref, @(time) ad_static_ref, m, g, T_min, T_max, phi_max_abs, theta_max_abs);
+fprintf('      Static setpoint tracking simulated.\n');
+
+target_state_static_plot = [pd_static_ref; vd_static_ref];
+plot_nonlinear_controller_results(t_nlc_static, x_nlc_static, target_state_static_plot, ...
+                                  ua_nlc_static_cmds, T_nlc_static, phi_nlc_static, theta_nlc_static, m*g, ...
+                                  'Nonlinear Controller - Static Setpoint Tracking');
+fprintf('      Plotting for Nonlinear Controller (Static Setpoint) completed.\n');
+
+
+% Case 2: Tracking a Time-Varying Trajectory (Circular Path)
+fprintf('\n   Case 2: Tracking a Time-Varying Trajectory (Circular Path) with Nonlinear Controller.\n');
+x0_nlc_traj = [0.9; 0; 0.5; 0; 0; 0]; % Initial state
+
+% Circular trajectory parameters
+radius = 0.5;   % meters
+omega_traj  = 0.5;   % rad/s (angular speed)
+z_height = 0.7; % meters
+center_x = 0.0; center_y = 0.0;
+
+% Trajectory functions: pd(t), vd(t), ad(t)
+pd_traj_func = @(t) [center_x + radius*cos(omega_traj*t); center_y + radius*sin(omega_traj*t); z_height];
+vd_traj_func = @(t) [-radius*omega_traj*sin(omega_traj*t); radius*omega_traj*cos(omega_traj*t); 0];
+ad_traj_func = @(t) [-radius*omega_traj^2*cos(omega_traj*t); -radius*omega_traj^2*sin(omega_traj*t); 0];
+fprintf('      Tracking circular trajectory: R=%.1fm, omega=%.1frad/s, Z=%.1fm.\n', radius, omega_traj, z_height);
+
+t_end_traj = 2 * pi / omega_traj * 1.5; % Simulate for 1.5 periods
+t_eval_traj = t_start:dt:t_end_traj;
+
+[t_nlc_traj, x_nlc_traj_raw] = ode45(@(t,x_state) nonlinear_dynamics_with_nonlinear_controller(t, x_state, m, g, ...
+                                Kp_nl, Kd_nl, pd_traj_func, vd_traj_func, ad_traj_func, ...
+                                T_min, T_max, phi_max_abs, theta_max_abs), ...
+                                t_eval_traj, x0_nlc_traj, ode_options);
+x_nlc_traj = x_nlc_traj_raw';
+
+% Extract controls for nonlinear trajectory tracking
+[ua_nlc_traj_cmds, T_nlc_traj, phi_nlc_traj, theta_nlc_traj, pd_ref_traj_plot, vd_ref_traj_plot] = ...
+    extract_controls_from_nlc_sim(t_nlc_traj, x_nlc_traj, Kp_nl, Kd_nl, pd_traj_func, vd_traj_func, ad_traj_func, m, g, T_min, T_max, phi_max_abs, theta_max_abs, true);
+fprintf('      Circular trajectory tracking simulated.\n');
+
+target_state_traj_plot = [pd_ref_traj_plot; vd_ref_traj_plot];
+plot_nonlinear_controller_results(t_nlc_traj, x_nlc_traj, target_state_traj_plot, ...
+                                  ua_nlc_traj_cmds, T_nlc_traj, phi_nlc_traj, theta_nlc_traj, m*g, ...
+                                  'Nonlinear Controller - Circular Trajectory Tracking');
+
+% 3D plot of trajectory
+figure('Name', 'Nonlinear Controller - 3D Trajectory Tracking', 'NumberTitle', 'off');
+plot3(x_nlc_traj(1,:), x_nlc_traj(2,:), x_nlc_traj(3,:), 'r-', 'LineWidth', 1.5, 'DisplayName', 'Actual Path');
+hold on;
+plot3(pd_ref_traj_plot(1,:), pd_ref_traj_plot(2,:), pd_ref_traj_plot(3,:), 'k--', 'LineWidth', 1.5, 'DisplayName', 'Desired Path');
+plot3(x0_nlc_traj(1), x0_nlc_traj(2), x0_nlc_traj(3), 'go', 'MarkerSize', 10, 'MarkerFaceColor', 'g', 'DisplayName', 'Start');
+xlabel('X (m)'); ylabel('Y (m)'); zlabel('Z (m)'); title('3D Trajectory Tracking');
+axis equal; grid on; legend('show'); view(30, 20); hold off;
+fprintf('      Plotting for Nonlinear Controller (Circular Trajectory) completed.\n');
+
+% --- 2.3 & 2.4: Real Drone Trials and RMSE (Conceptual) ---
+% These sections are typically for physical experiments.
+% Since this is simulation-focused, we acknowledge the steps.
+fprintf('\n--- 2.3 & 2.4: Real Drone Trials and RMSE (Conceptual) ---\n');
+fprintf('   - 2.3: Implementation on real drone (Python function) would follow these principles.\n');
+fprintf('   - 2.4: RMSE would be computed from logged experimental data (pRMSE, vRMSE).\n');
+fprintf('      pRMSE = sqrt((1/N) * sum(||p_actual - p_desired||^2))\n');
+fprintf('      vRMSE = sqrt((1/N) * sum(||v_actual - v_desired||^2))\n');
+
+fprintf('\nEnd of PART 2.\n');
+fprintf('----------------------------------------\n');
+fprintf('Simulation Complete.\n');
+
+%% --- Helper Functions ---
+
+% Nonlinear plant dynamics model
+function dx_dt = nonlinear_plant_dynamics(current_state, T_cmd, phi_cmd, theta_cmd, psi_cmd, m_drone, g_accel)
+    v = current_state(4:6); % Current velocity [vx; vy; vz]
+
+    % Rotation Matrix (Body to World), ZYX convention (psi, theta, phi)
+    cphi = cos(phi_cmd); sphi = sin(phi_cmd);
+    cth = cos(theta_cmd); sth = sin(theta_cmd);
+    cpsi = cos(psi_cmd); spsi = sin(psi_cmd);
+
+    R_BW = [cpsi*cth, cpsi*sth*sphi - spsi*cphi, cpsi*sth*cphi + spsi*sphi;
+            spsi*cth, spsi*sth*sphi + cpsi*cphi, spsi*sth*cphi - cpsi*sphi;
+            -sth,     cth*sphi,                  cth*cphi];
+    
+    F_thrust_body = [0; 0; T_cmd]; % Thrust vector in body frame
+    F_thrust_world = R_BW * F_thrust_body; % Thrust vector in world frame
+    F_gravity_world = [0; 0; -m_drone * g_accel]; % Gravity in world frame
+    
+    F_total_world = F_thrust_world + F_gravity_world; % Total force
+    p_ddot = F_total_world / m_drone; % Acceleration (Newton's 2nd Law)
+
+    dx_dt = [v; p_ddot]; % State derivatives [p_dot; v_dot]
+end
+
+% Convert desired acceleration `ua` to actual T, phi, theta commands
+function [T_actual, phi_actual, theta_actual] = ua_to_actual_controls(ua_desired, m_drone, g_accel, T_lim_min, T_lim_max, phi_lim_abs, theta_lim_abs)
+    uax = ua_desired(1); uay = ua_desired(2); uaz = ua_desired(3);
+    
+    T_desired = m_drone * (uaz + g_accel);
+    T_actual = max(T_lim_min, min(T_lim_max, T_desired)); % Saturate thrust
+    
+    T_over_m_eff = T_actual / m_drone; % Effective T/m after saturation
+    
+    if T_over_m_eff < 1e-6 % Avoid division by zero if thrust is negligible
+        theta_desired_rad = 0; phi_desired_rad = 0;
+    else
+        theta_desired_rad = uax / T_over_m_eff;
+        phi_desired_rad = -uay / T_over_m_eff;
+    end
+    
+    % Saturate angles
+    phi_actual = max(-phi_lim_abs, min(phi_lim_abs, phi_desired_rad));
+    theta_actual = max(-theta_lim_abs, min(theta_lim_abs, theta_desired_rad));
+end
+
+% ODE function for nonlinear dynamics with LQR controller
+function dx_dt = nonlinear_dynamics_with_lqr(t, current_state, m_drone, g_accel, K_lqr, ...
+                                               T_lim_min, T_lim_max, phi_lim_abs, theta_lim_abs, ...
+                                               x_state_ref, ua_ff_ref)
+    error_state = current_state - x_state_ref;
+    ua_feedback = -K_lqr * error_state;
+    ua_command = ua_feedback + ua_ff_ref; % ua_cmd = ua_ff - K*(x-x_ref)
+    
+    [T_act, phi_act, theta_act] = ua_to_actual_controls(ua_command, m_drone, g_accel, ...
+                                                        T_lim_min, T_lim_max, phi_lim_abs, theta_lim_abs);
+    psi_actual = 0; % Assume zero yaw control
+
+    dx_dt = nonlinear_plant_dynamics(current_state, T_act, phi_act, theta_act, psi_actual, m_drone, g_accel);
+end
+
+% ODE function for nonlinear dynamics with the custom Nonlinear Controller
+function dx_dt = nonlinear_dynamics_with_nonlinear_controller(t, current_state, m_drone, g_accel, ...
+                                               Kp_ctrl, Kd_ctrl, ...
+                                               pd_fnc, vd_fnc, ad_fnc, ...
+                                               T_lim_min, T_lim_max, phi_lim_abs, theta_lim_abs)
+    p_curr = current_state(1:3); v_curr = current_state(4:6);
+    
+    pd_des = pd_fnc(t); vd_des = vd_fnc(t); ad_des = ad_fnc(t); % Desired state from trajectory
+    
+    ep = p_curr - pd_des; % Position error
+    ev = v_curr - vd_des; % Velocity error
+    
+    % Nonlinear control law: ua_cmd = ad_ff - Kp*ep - Kd*ev
+    ua_command = ad_des - Kp_ctrl * ep - Kd_ctrl * ev;
+    
+    [T_act, phi_act, theta_act] = ua_to_actual_controls(ua_command, m_drone, g_accel, ...
+                                                        T_lim_min, T_lim_max, phi_lim_abs, theta_lim_abs);
+    psi_actual = 0; % Assume zero yaw control
+
+    dx_dt = nonlinear_plant_dynamics(current_state, T_act, phi_act, theta_act, psi_actual, m_drone, g_accel);
+end
+
+% Helper to reconstruct control inputs from LQR simulation results
+function [ua_cmds, T_actual_hist, phi_actual_hist, theta_actual_hist] = ...
+    extract_controls_from_lqr_sim(t_hist, x_hist, K_gain, x_ref, ua_ff, m_drone, g_accel, T_lim_min, T_lim_max, phi_lim_abs, theta_lim_abs)
+    
+    num_points = length(t_hist);
+    ua_cmds = zeros(3, num_points);
+    T_actual_hist = zeros(1, num_points);
+    phi_actual_hist = zeros(1, num_points);
+    theta_actual_hist = zeros(1, num_points);
+
+    for i = 1:num_points
+        x_curr = x_hist(:,i);
+        err = x_curr - x_ref;
+        ua_fb_curr = -K_gain * err;
+        ua_cmd_curr = ua_fb_curr + ua_ff;
+        ua_cmds(:,i) = ua_cmd_curr;
+        [T_act, phi_act, theta_act] = ua_to_actual_controls(ua_cmd_curr, m_drone, g_accel, T_lim_min, T_lim_max, phi_lim_abs, theta_lim_abs);
+        T_actual_hist(i) = T_act;
+        phi_actual_hist(i) = phi_act;
+        theta_actual_hist(i) = theta_act;
+    end
+end
+
+% Helper to reconstruct control inputs from Nonlinear Controller simulation
+function [ua_cmds, T_actual_hist, phi_actual_hist, theta_actual_hist, pd_ref_hist, vd_ref_hist] = ...
+    extract_controls_from_nlc_sim(t_hist, x_hist, Kp_gain, Kd_gain, pd_f, vd_f, ad_f, m_drone, g_accel, T_lim_min, T_lim_max, phi_lim_abs, theta_lim_abs, calc_ref)
+    
+    if nargin < 14
+        calc_ref = false; % Default: don't calculate reference history
+    end
+
+    num_points = length(t_hist);
+    ua_cmds = zeros(3, num_points);
+    T_actual_hist = zeros(1, num_points);
+    phi_actual_hist = zeros(1, num_points);
+    theta_actual_hist = zeros(1, num_points);
+    pd_ref_hist = [];
+    vd_ref_hist = [];
+
+    if calc_ref
+        pd_ref_hist = zeros(3, num_points);
+        vd_ref_hist = zeros(3, num_points);
+    end
+
+    for i = 1:num_points
+        t_curr_loop = t_hist(i);
+        p_curr_loop = x_hist(1:3, i);
+        v_curr_loop = x_hist(4:6, i);
+        
+        pd_des_loop = pd_f(t_curr_loop);
+        vd_des_loop = vd_f(t_curr_loop);
+        ad_des_loop = ad_f(t_curr_loop);
+
+        if calc_ref
+            pd_ref_hist(:,i) = pd_des_loop;
+            vd_ref_hist(:,i) = vd_des_loop;
+        end
+        
+        ep_loop = p_curr_loop - pd_des_loop;
+        ev_loop = v_curr_loop - vd_des_loop;
+        
+        ua_cmd_curr = ad_des_loop - Kp_gain*ep_loop - Kd_gain*ev_loop;
+        ua_cmds(:,i) = ua_cmd_curr;
+        
+        [T_act, phi_act, theta_act] = ua_to_actual_controls(ua_cmd_curr, m_drone, g_accel, T_lim_min, T_lim_max, phi_lim_abs, theta_lim_abs);
+        T_actual_hist(i) = T_act;
+        phi_actual_hist(i) = phi_act;
+        theta_actual_hist(i) = theta_act;
+    end
+end
+
+
+% --- Plotting Functions ---
+% Plot LQR Regulation Results
+function plot_regulation_results(t_lin_sim, x_lin_sim, t_nl_sim, x_nl_sim, x_ref_val, ua_nl_commands, T_nl_vals, phi_nl_vals, theta_nl_vals, mg_val)
+    figure('Name', '1.4 LQR Regulation: State Trajectories', 'NumberTitle', 'off');
+
+    % --- DEFINE COLORS FOR THIS FUNCTION ---
+    color_linear_sim = [0, 0.4470, 0.7410];      % Blue for linear sim
+    color_nonlinear_actual = [0.8500, 0.3250, 0.0980]; % Red for nonlinear sim
+    color_reference = [0.3 0.3 0.3];                    % Dark Gray for reference
+    % --- END OF COLOR DEFINITIONS ---
+
+    state_labels = {'p_x (m)', 'p_y (m)', 'p_z (m)', 'v_x (m/s)', 'v_y (m/s)', 'v_z (m/s)'};
+    state_titles = {'Position X', 'Position Y', 'Position Z', 'Velocity X', 'Velocity Y', 'Velocity Z'};
+    for k=1:6
+        subplot(3,2,k); hold on; grid on;
+        plot(t_lin_sim, x_lin_sim(k,:), '--', 'Color', color_linear_sim, 'LineWidth', 1.2, 'DisplayName', 'Linear Sim');
+        plot(t_nl_sim, x_nl_sim(k,:), '-', 'Color', color_nonlinear_actual, 'LineWidth', 1.5, 'DisplayName', 'Nonlinear Sim');
+        plot(t_nl_sim, ones(size(t_nl_sim))*x_ref_val(k), ':', 'Color', color_reference, 'LineWidth', 1.5, 'DisplayName', 'Reference'); % Increased LineWidth
+        ylabel(state_labels{k}); title(state_titles{k});
+        if k==1, legend('show', 'Location','northeast'); end
+        if k > 4, xlabel('Time (s)'); end
+        hold off;
+    end
+    sgtitle('1.4 LQR Regulation: State Trajectories');
+
+    plot_control_inputs(t_nl_sim, ua_nl_commands, T_nl_vals, phi_nl_vals, theta_nl_vals, mg_val, '1.4 LQR Regulation: Control Inputs (Nonlinear Sim)');
+end
+
+% Plot LQR Tracking Results
+function plot_tracking_results(t_nl_sim, x_nl_sim, x_ref_val, ua_nl_commands, T_nl_vals, phi_nl_vals, theta_nl_vals, mg_val)
+    figure('Name', '1.6 LQR Tracking: State Trajectories (Nonlinear Sim)', 'NumberTitle', 'off');
+
+    % --- DEFINE COLORS FOR THIS FUNCTION ---
+    color_nonlinear_actual = [0.8500, 0.3250, 0.0980]; % Red for actual nonlinear sim data
+    color_reference = [0.3 0.3 0.3];                    % Dark Gray for reference
+    % --- END OF COLOR DEFINITIONS ---
+
+    state_labels = {'p_x (m)', 'p_y (m)', 'p_z (m)', 'v_x (m/s)', 'v_y (m/s)', 'v_z (m/s)'};
+    state_titles = {'Position X Tracking', 'Position Y Tracking', 'Position Z Tracking', 'Velocity X Tracking', 'Velocity Y Tracking', 'Velocity Z Tracking'};
+    for k=1:6
+        subplot(3,2,k); hold on; grid on;
+        plot(t_nl_sim, x_nl_sim(k,:), '-', 'Color', color_nonlinear_actual, 'LineWidth', 1.5, 'DisplayName', 'Actual');
+        plot(t_nl_sim, ones(size(t_nl_sim))*x_ref_val(k), ':', 'Color', color_reference, 'LineWidth', 1.5, 'DisplayName', 'Reference'); % Increased LineWidth
+        ylabel(state_labels{k}); title(state_titles{k});
+        if k==1, legend('show', 'Location','best'); end
+        if k > 4, xlabel('Time (s)'); end
+        hold off;
+    end
+    sgtitle('1.6 LQR Tracking: State Trajectories (Nonlinear Sim)');
+
+    plot_control_inputs(t_nl_sim, ua_nl_commands, T_nl_vals, phi_nl_vals, theta_nl_vals, mg_val, '1.6 LQR Tracking: Control Inputs (Nonlinear Sim)');
+end
+
+% Plot Nonlinear Controller Results (Static or Trajectory)
+function plot_nonlinear_controller_results(t_sim, x_sim, x_ref_full, ua_commands, T_vals, phi_vals, theta_vals, mg_val, fig_title_main)
+    % Ensure x_ref_full is correctly dimensioned for plotting
+    % ... (rest of your existing dimension checking code for x_ref_full) ...
+    if size(x_ref_full, 2) == 1 && length(t_sim) > 1
+        x_ref_full = repmat(x_ref_full, 1, length(t_sim)); % Expand static reference
+    elseif size(x_ref_full, 2) ~= length(t_sim) && length(t_sim) > 0
+        warning('Reference trajectory length mismatch. Interpolating/extrapolating for plotting.');
+        x_ref_temp = zeros(size(x_sim,1), length(t_sim));
+        if size(x_ref_full, 2) > 0
+            for k_dim = 1:size(x_ref_full,1)
+                x_ref_temp(k_dim, :) = interp1(linspace(0,1,size(x_ref_full,2)), x_ref_full(k_dim,:), linspace(0,1,length(t_sim)), 'linear', 'extrap');
+            end
+        end
+        x_ref_full = x_ref_temp;
+    end
+    pd_ref_plot = x_ref_full(1:3,:);
+    vd_ref_plot = x_ref_full(4:6,:);
+
+    figure_name_states = [fig_title_main, ' - State Trajectories'];
+    h_fig_states = figure('Name', figure_name_states, 'NumberTitle', 'off');
+    
+    % --- COLORS DEFINED HERE (as you had them) ---
+    color_actual_data = [0.8500, 0.3250, 0.0980]; % Example: Red
+    color_desired_reference = [0.3 0.3 0.3];        % Example: Dark Gray
+    % --- END OF COLOR DEFINITIONS ---
+
+    state_labels = {'p_x (m)', 'p_y (m)', 'p_z (m)', 'v_x (m/s)', 'v_y (m/s)', 'v_z (m/s)'};
+    state_titles = {'Position X', 'Position Y', 'Position Z', 'Velocity X', 'Velocity Y', 'Velocity Z'};
+    for k=1:6
+        subplot(3,2,k); hold on; grid on;
+        plot(t_sim, x_sim(k,:), '-', 'Color', color_actual_data, 'LineWidth', 1.5, 'DisplayName', 'Actual');
+        if k <= 3
+            plot(t_sim, pd_ref_plot(k,:), ':', 'Color', color_desired_reference, 'LineWidth', 1.5, 'DisplayName', 'Desired');
+        else
+            plot(t_sim, vd_ref_plot(k-3,:), ':', 'Color', color_desired_reference, 'LineWidth', 1.5, 'DisplayName', 'Desired');
+        end
+        ylabel(state_labels{k}); title(state_titles{k});
+        if k==1, legend('show', 'Location','best'); end
+        if k > 4, xlabel('Time (s)'); end
+        hold off;
+    end
+    sgtitle(h_fig_states, figure_name_states);
+
+    plot_control_inputs(t_sim, ua_commands, T_vals, phi_vals, theta_vals, mg_val, [fig_title_main, ' - Control Inputs']);
+end
+
+% Generic function to plot control inputs
+function plot_control_inputs(t, ua_cmds, T_actual, phi_actual, theta_actual, mg, title_str)
+    figure('Name', title_str, 'NumberTitle', 'off');
+
+    % Define a color palette (using MATLAB's default "parula" colormap access for good colors)
+    colors = parula(7); % Get 7 distinct colors from the parula map
+    % Or define custom colors:
+    % color_blue = [0, 0.4470, 0.7410];
+    % color_red = [0.8500, 0.3250, 0.0980];
+    % color_green = [0.4660, 0.6740, 0.1880];
+    % color_purple = [0.4940, 0.1840, 0.5560];
+    % color_orange = [0.9290, 0.6940, 0.1250];
+    % color_gray_ref = [0.5 0.5 0.5];
+
+    color_uax = [0, 0.4470, 0.7410];    % Blue
+    color_uay = [0.8500, 0.3250, 0.0980];% Red
+    color_uaz = [0.4660, 0.6740, 0.1880];% Green
+    
+    color_thrust_actual = [0.6350, 0.0780, 0.1840]; % Dark Red/Maroon for actual thrust
+    color_thrust_hover = [0.3 0.3 0.3]; % Dark Gray for hover thrust reference
+
+    color_phi = [0.4940, 0.1840, 0.5560]; % Purple
+    color_theta = [0.9290, 0.6940, 0.1250];% Orange
+    
+    subplot(3,1,1); hold on; grid on;
+    plot(t, ua_cmds(1,:), 'Color', color_uax, 'LineWidth', 1.5, 'DisplayName', 'ua_x cmd');
+    plot(t, ua_cmds(2,:), 'Color', color_uay, 'LineWidth', 1.5, 'DisplayName', 'ua_y cmd');
+    plot(t, ua_cmds(3,:), 'Color', color_uaz, 'LineWidth', 1.5, 'DisplayName', 'ua_z cmd');
+    ylabel('ua (m/s^2)'); title('Commanded Accelerations (ua_{cmd})'); legend('show', 'Location','best');
+    hold off;
+    
+    subplot(3,1,2); hold on; grid on;
+    plot(t, T_actual, 'Color', color_thrust_actual, 'LineWidth', 1.5, 'DisplayName', 'Actual Thrust T');
+    plot(t, ones(size(t))*mg, ':', 'Color', color_thrust_hover, 'LineWidth', 1.2, 'DisplayName', 'mg (Hover Thrust)');
+    ylabel('Thrust (N)'); legend('show', 'Location','best');
+    hold off;
+    
+    subplot(3,1,3); hold on; grid on;
+    plot(t, rad2deg(phi_actual), 'Color', color_phi, 'LineWidth', 1.5, 'DisplayName', 'Actual \phi (roll)');
+    plot(t, rad2deg(theta_actual), 'Color', color_theta, 'LineWidth', 1.5, 'DisplayName', 'Actual \theta (pitch)');
+    ylabel('Angles (deg)'); xlabel('Time (s)'); legend('show', 'Location','best');
+    hold off;
+    
+    sgtitle(title_str);
+end
